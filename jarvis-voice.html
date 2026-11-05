@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ジャービス音声読み上げ</title>
+<style>
+  body{margin:0;background:#050b14;color:#7fe9ff;font-family:system-ui,sans-serif;padding:16px}
+  #log{min-height:120px;border:1px solid #1d5a6e;border-radius:8px;padding:12px;margin-bottom:12px}
+  #log p{margin:0 0 8px}
+  textarea{width:100%;box-sizing:border-box;background:#0a1624;color:#7fe9ff;border:1px solid #1d5a6e;border-radius:8px;padding:8px;font-size:16px}
+  button.demo{background:#0a1624;color:#7fe9ff;border:1px solid #1d5a6e;border-radius:8px;padding:10px 14px;margin:8px 8px 0 0;font-size:15px}
+</style>
+</head>
+<body>
+
+<!-- ▼ デモ用の画面。自分のアプリでは、返事を表示している要素のid(ここでは #log)に置き換えてください -->
+<div id="log"></div>
+<textarea id="t" rows="3">こんにちは。ジャービスです。今日の予定をお伝えします。午後三時に打ち合わせがあります。</textarea>
+<button class="demo" id="send">返事を出す(テスト)</button>
+<button class="demo" id="mic">話しかける(テスト)</button>
+<!-- ▲ デモここまで -->
+
+<script>
+/* ===== ここから JarvisVoice(自分のアプリにこのブロックをコピー) ===== */
+const JarvisVoice = (() => {
+  const synth = window.speechSynthesis;
+  let muted = false, listening = false, voice = null, pending = '', gen = 0, btn = null;
+  const keep = []; // ブラウザが発話オブジェクトを破棄しないよう保持
+  try { muted = localStorage.getItem('jarvis_muted') === '1'; } catch (e) {}
+
+  // 日本語の声を選ぶ(端末にある中で品質が高そうなものを優先)
+  function pickVoice() {
+    const ja = synth.getVoices().filter(v => /^ja/i.test(v.lang.replace('_', '-')));
+    const prefer = /Kyoko|O-Ren|Otoya|Nanami|Haruka|Google|Enhanced|Premium/i;
+    voice = ja.find(v => prefer.test(v.name)) || ja[0] || null;
+  }
+  pickVoice();
+  if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = pickVoice;
+
+  // 読み上げに向かない記号・URL・絵文字・コードを除去
+  function clean(t) {
+    return String(t)
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/[*#`_>~|]/g, '')
+      .replace(/\p{Extended_Pictographic}/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // 文ごとに分割(長文が途中で止まるスマホブラウザの不具合対策)
+  function split(t) {
+    const out = [];
+    (t.match(/[^。！？!?\n]+[。！？!?]*/g) || []).forEach(s => {
+      for (let i = 0; i < s.length; i += 100) out.push(s.slice(i, i + 100));
+    });
+    return out;
+  }
+
+  function stop() { gen++; synth.cancel(); keep.length = 0; }
+
+  function speak(text) {
+    const t = clean(text);
+    if (!t || muted) return;
+    if (listening) { pending = t; return; }   // 話しかけ中は保留
+    stop();
+    const my = gen;
+    // Android Chromeでcancel直後のspeakが無視されることがあるため少し待つ
+    setTimeout(() => {
+      if (my !== gen) return;
+      split(t).forEach(s => {
+        const u = new SpeechSynthesisUtterance(s);
+        u.lang = 'ja-JP';
+        if (voice) u.voice = voice;
+        u.rate = 1.05; u.pitch = 1.0;
+        keep.push(u);
+        synth.speak(u);
+      });
+    }, 80);
+  }
+
+  // 話しかけている間は読み上げを止める(ジャービスの声をマイクが拾わないように)
+  function setListening(on) {
+    listening = on;
+    if (on) { pending = ''; stop(); }
+    else if (pending) { const p = pending; pending = ''; speak(p); }
+  }
+
+  // SpeechRecognition を使っているなら、これを呼ぶだけで連動する
+  function attachRecognition(rec) {
+    rec.addEventListener('speechstart', () => setListening(true));
+    rec.addEventListener('speechend', () => setListening(false));
+    rec.addEventListener('end', () => setListening(false));
+  }
+
+  function setMuted(m) {
+    muted = m;
+    try { localStorage.setItem('jarvis_muted', m ? '1' : '0'); } catch (e) {}
+    if (m) stop();
+    if (btn) { btn.textContent = m ? '🔇' : '🔊'; btn.setAttribute('aria-label', m ? 'ミュート中' : '音声オン'); }
+  }
+
+  // 返事が入る要素を監視して自動で読み上げる(return しない側の簡易版)
+  function watch(el) {
+    let timer = null, last = '';
+    new MutationObserver(muts => {
+      muts.forEach(m => m.addedNodes.forEach(n => { last = n.textContent || ''; }));
+      clearTimeout(timer);
+      timer = setTimeout(() => { if (last) speak(last); last = ''; }, 600); // ストリーミング表示の完了待ち
+    }).observe(el, { childList: true });
+  }
+
+  function init() {
+    btn = document.createElement('button');
+    btn.style.cssText = 'position:fixed;right:14px;bottom:14px;width:52px;height:52px;border-radius:50%;' +
+      'border:1px solid #1d5a6e;background:#0a1624;color:#7fe9ff;font-size:24px;z-index:9999;' +
+      'box-shadow:0 0 12px rgba(127,233,255,.4)';
+    btn.onclick = () => setMuted(!muted);
+    document.body.appendChild(btn);
+    setMuted(muted);
+    // iPhone等は最初のタップ操作の中で一度発話を起動しないと音が出ない
+    const unlock = () => {
+      const u = new SpeechSynthesisUtterance(' '); u.volume = 0; synth.speak(u);
+      window.removeEventListener('pointerdown', unlock);
+    };
+    window.addEventListener('pointerdown', unlock);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+
+  return { speak, stop, setMuted, setListening, attachRecognition, watch };
+})();
+/* ===== ここまで ===== */
+
+/* ---- デモ用の接続例 ---- */
+const log = document.getElementById('log');
+JarvisVoice.watch(log); // 方法A: 返事の表示欄を監視して自動で読み上げ
+// 方法B(確実): 返事を受け取った所で JarvisVoice.speak(返事テキスト) を呼ぶ
+
+document.getElementById('send').onclick = () => {
+  const p = document.createElement('p');
+  p.textContent = document.getElementById('t').value;
+  log.appendChild(p);
+};
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (SR) {
+  const rec = new SR(); rec.lang = 'ja-JP';
+  JarvisVoice.attachRecognition(rec); // 話し始めたら読み上げ停止
+  document.getElementById('mic').onclick = () => rec.start();
+} else {
+  document.getElementById('mic').style.display = 'none';
+}
+</script>
+</body>
+</html>
