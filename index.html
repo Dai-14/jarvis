@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS</title>
+<style>
+  html, body { margin:0; height:100%; background:#02080f; overflow:hidden; font-family:sans-serif; color:#7fe8ff; }
+  canvas#orb { position:fixed; inset:0; width:100%; height:100%; }
+  video#cam { position:fixed; right:8px; bottom:8px; width:96px; opacity:0.35; transform:scaleX(-1); border:1px solid #1b6a7d; border-radius:6px; }
+  #status { position:fixed; top:14px; left:0; right:0; text-align:center; letter-spacing:4px; font-size:13px; opacity:0.8; }
+  #heard { position:fixed; bottom:120px; left:5%; right:5%; text-align:center; font-size:18px; min-height:24px; }
+  #reply { position:fixed; bottom:60px; left:5%; right:5%; text-align:center; font-size:16px; color:#bff6ff; min-height:24px; }
+  #start { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#02080f; z-index:10; }
+  #start button { font-size:20px; padding:16px 32px; color:#7fe8ff; background:transparent; border:2px solid #7fe8ff; border-radius:40px; }
+  #mute { position:fixed; top:8px; right:8px; width:44px; height:44px; font-size:22px; border-radius:50%; border:1px solid #1b6a7d; background:rgba(2,8,15,0.6); color:#7fe8ff; z-index:5; box-shadow:0 0 10px rgba(127,232,255,0.3); }
+</style>
+</head>
+<body>
+<div id="start"><button id="startBtn">ジャービスを起動</button></div>
+<canvas id="orb"></canvas>
+<video id="cam" playsinline muted></video>
+<button id="mute" aria-label="ミュート切り替え">🔊</button>
+<div id="status">STANDBY</div>
+<div id="heard"></div>
+<div id="reply"></div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+// ===== もわもわ =====
+const canvas = document.getElementById('orb');
+const ctx = canvas.getContext('2d');
+let level = 0, smooth = 0, scale = 1, hue = 190;
+
+function resize(){ canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; }
+addEventListener('resize', resize); resize();
+
+function draw(t){
+  smooth += (level - smooth) * 0.15;
+  const w = canvas.width, h = canvas.height;
+  const cx = w/2, cy = h/2 - h*0.05;
+  const base = Math.min(w,h) * 0.16 * scale;
+  ctx.fillStyle = 'rgba(2,8,15,0.25)';
+  ctx.fillRect(0,0,w,h);
+  for (let ring = 0; ring < 4; ring++){
+    ctx.beginPath();
+    const r0 = base * (1 + ring*0.28) * (1 + smooth*0.8);
+    for (let a = 0; a <= Math.PI*2 + 0.05; a += 0.05){
+      const wob = Math.sin(a*5 + t/400 + ring) * smooth * base*0.25
+                + Math.sin(a*3 - t/700 + ring*2) * base*0.04;
+      const r = r0 + wob;
+      const x = cx + Math.cos(a)*r, y = cy + Math.sin(a)*r;
+      if (a === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = `hsla(${hue},100%,${60 + ring*5}%,${0.8 - ring*0.17})`;
+    ctx.lineWidth = (3 - ring*0.5) * devicePixelRatio;
+    ctx.shadowColor = `hsl(${hue},100%,60%)`;
+    ctx.shadowBlur = 20 * devicePixelRatio;
+    ctx.stroke();
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ===== 声の呼びかけ =====
+const statusEl = document.getElementById('status');
+const heardEl = document.getElementById('heard');
+const replyEl = document.getElementById('reply');
+const video = document.getElementById('cam');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recog = null, awake = false, sleepTimer = null, speaking = false;
+
+async function startMic(){
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio:{ echoCancellation:true, noiseSuppression:true },
+    video:{ facingMode:'user' }
+  });
+  video.srcObject = stream;
+  await video.play();
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ac.createMediaStreamSource(stream);
+  const an = ac.createAnalyser();
+  an.fftSize = 512;
+  src.connect(an);
+  const buf = new Uint8Array(an.frequencyBinCount);
+  (function loop(){
+    an.getByteFrequencyData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i];
+    level = Math.min(1, (sum / buf.length) / 70);
+    requestAnimationFrame(loop);
+  })();
+}
+
+function setAwake(on){
+  awake = on;
+  statusEl.textContent = on ? 'LISTENING' : 'STANDBY';
+  hue = on ? 170 : 190;
+  clearTimeout(sleepTimer);
+  if (on) sleepTimer = setTimeout(() => setAwake(false), 12000);
+}
+
+// ===== ジャービスの声 =====
+// 声の調子はここで調整できます(pitchを1に近づけるほど自然、下げるほどロボット風)
+const VOICE_PITCH = 0.85;
+const VOICE_RATE = 1.0;
+
+let jarvisVoice = null;
+function pickVoice(){
+  const voices = speechSynthesis.getVoices().filter(v => v.lang.replace('_','-').startsWith('ja'));
+  const maleHints = ['Otoya', 'Ichiro', 'Hattori', 'Male', '男'];
+  jarvisVoice = voices.find(v => maleHints.some(h => v.name.includes(h))) || voices[0] || null;
+}
+speechSynthesis.onvoiceschanged = pickVoice;
+pickVoice();
+
+// ミュート(設定は次回も残る)
+const muteBtn = document.getElementById('mute');
+let muted = false;
+try { muted = localStorage.getItem('jarvis_muted') === '1'; } catch(e){}
+function renderMute(){ muteBtn.textContent = muted ? '🔇' : '🔊'; }
+renderMute();
+muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  try { localStorage.setItem('jarvis_muted', muted ? '1' : '0'); } catch(e){}
+  if (muted) stopSpeaking();
+  renderMute();
+});
+
+let gen = 0;
+const keep = []; // 発話オブジェクトが途中で消えないよう保持
+
+function stopSpeaking(){
+  gen++;
+  speechSynthesis.cancel();
+  keep.length = 0;
+  speaking = false;
+}
+
+function cleanForSpeech(t){
+  return String(t)
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[*#`_>~|]/g, '')
+    .replace(/\p{Extended_Pictographic}/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 文ごとに区切る(スマホで長文が途中で止まるのを防ぐ)
+function splitSentences(t){
+  const out = [];
+  (t.match(/[^。！？!?\n]+[。！？!?]*/g) || []).forEach(s => {
+    for (let i = 0; i < s.length; i += 100) out.push(s.slice(i, i + 100));
+  });
+  return out;
+}
+
+function speak(text){
+  replyEl.textContent = text;     // 文字表示は今まで通り
+  if (muted) return;
+  const parts = splitSentences(cleanForSpeech(text));
+  if (!parts.length) return;
+  stopSpeaking();
+  const my = gen;
+  speaking = true;
+  // Androidではcancel直後のspeakが無視されることがあるので少し待つ
+  setTimeout(() => {
+    if (my !== gen) return;
+    parts.forEach((s, i) => {
+      const u = new SpeechSynthesisUtterance(s);
+      u.lang = 'ja-JP';
+      if (jarvisVoice) u.voice = jarvisVoice;
+      u.pitch = VOICE_PITCH;
+      u.rate = VOICE_RATE;
+      if (i === parts.length - 1){
+        const done = () => {
+          if (my !== gen) return;
+          // 余韻をマイクが拾わないよう、少し待ってから聞き取り再開
+          setTimeout(() => { if (my === gen) speaking = false; }, 600);
+        };
+        u.onend = done;
+        u.onerror = done;
+      }
+      keep.push(u);
+      speechSynthesis.speak(u);
+    });
+  }, 80);
+}
+
+function handle(text){
+  if (text.includes('ありがとう')) return speak('どういたしまして');
+  if (text.includes('時間') || text.includes('何時')) {
+    const d = new Date();
+    return speak(`${d.getHours()}時${d.getMinutes()}分です`);
+  }
+  speak(`${text}、ですね。聞こえました`);
+}
+
+function startRecognition(){
+  if (!SR){ statusEl.textContent = 'このブラウザは音声認識に未対応です'; return; }
+  recog = new SR();
+  recog.lang = 'ja-JP';
+  recog.continuous = true;
+  recog.interimResults = true;
+  // こちらが話し始めたら、ジャービスの読み上げを止める
+  recog.onspeechstart = () => { if (speaking) stopSpeaking(); };
+  recog.onresult = (e) => {
+    if (speaking) return;
+    const r = e.results[e.results.length - 1];
+    const text = r[0].transcript.trim();
+    heardEl.textContent = text;
+    if (!awake){
+      if (/ジャービス|じゃーびす|ジャーヴィス|jarvis/i.test(text)){
+        setAwake(true);
+        heardEl.textContent = '';
+      }
+      return;
+    }
+    if (r.isFinal){
+      const cleaned = text.replace(/ジャービス|ジャーヴィス/g, '').trim();
+      if (cleaned) handle(cleaned);
+      setAwake(true);
+    }
+  };
+  recog.onend = () => { try { recog.start(); } catch(e){} };
+  recog.start();
+}
+
+// ===== 手のジェスチャー =====
+let handLandmarker = null, pinching = false, lastVideoTime = -1, openSince = 0;
+
+async function startGesture(){
+  const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task' },
+    runningMode: 'VIDEO',
+    numHands: 1
+  });
+  detectLoop();
+}
+
+function dist(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function detectLoop(){
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime){
+    lastVideoTime = video.currentTime;
+    const res = handLandmarker.detectForVideo(video, performance.now());
+    if (res.landmarks && res.landmarks.length){
+      const h = res.landmarks[0];
+      const palm = dist(h[0], h[9]);
+      const pinch = dist(h[4], h[8]) / palm;
+      const tips = [8,12,16,20].map(i => dist(h[0], h[i]) / palm);
+      const open = tips.reduce((s,v)=>s+v,0) / tips.length;
+      if (pinch < 0.25){
+        if (!pinching){ pinching = true; setAwake(true); heardEl.textContent = '(つまんだ)'; }
+        scale += (0.7 - scale) * 0.2;
+      } else {
+        pinching = false;
+        if (open > 1.7){
+          scale += (1.5 - scale) * 0.1;
+          if (!openSince) openSince = performance.now();
+          if (performance.now() - openSince > 1500 && !awake) setAwake(true);
+        } else {
+          openSince = 0;
+          scale += (1 - scale) * 0.1;
+        }
+      }
+    } else {
+      openSince = 0;
+      scale += (1 - scale) * 0.1;
+    }
+  }
+  requestAnimationFrame(detectLoop);
+}
+
+// ===== 起動 =====
+document.getElementById('startBtn').addEventListener('click', async () => {
+  document.getElementById('start').style.display = 'none';
+  // iPhoneなどは、ボタンを押したこの操作の中で一度発話を起動しないと声が出ない
+  try {
+    const u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0;
+    speechSynthesis.speak(u);
+  } catch(e){}
+  try {
+    await startMic();
+    startRecognition();
+    startGesture();
+  } catch (err) {
+    statusEl.textContent = 'ERROR: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
